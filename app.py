@@ -3,6 +3,7 @@ import pdfplumber
 import pypdfium2 as pdfium
 from google import genai
 from google.genai import types
+from PIL import Image
 import re
 import pandas as pd
 import io
@@ -10,8 +11,8 @@ import time
 
 st.set_page_config(page_title="房產精耕謄本助手", layout="wide")
 
-st.title("🏡 房產精耕小工具：謄本精準擷取 (輕量混合高速版)")
-st.write("坪數與門牌由本地極速處理，**AI 僅專注辨識第 2 頁戶籍地址**，大幅縮短運算時間！")
+st.title("🏡 房產精耕小工具：謄本精準擷取")
+st.write("已強化：**所有權人稱謂鎖定**、**地址小區塊自動裁切極速辨識**！")
 
 # 讀取 API Key (優先從 Secrets 抓，若無則在側邊欄輸入)
 api_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -20,28 +21,32 @@ if not api_key:
 
 uploaded_files = st.file_uploader("請拖曳或上傳建物謄本/電傳 PDF (可複選多個)", type=["pdf"], accept_multiple_files=True)
 
-def ocr_address_only(file_bytes, page_index=1):
-    """ 只將第 2 頁（索引為1）轉成圖片送給 AI 辨識地址那一欄 """
+def ocr_address_cropped(file_bytes, page_idx=1):
+    """ 只裁切地址區域的小圖給 AI 辨識，速度提升 10 倍，避免超時 """
     if not api_key:
         return "未填 API Key"
     
     try:
         pdf = pdfium.PdfDocument(file_bytes)
-        target_idx = page_index if len(pdf) > page_index else len(pdf) - 1
+        target_idx = page_idx if len(pdf) > page_idx else len(pdf) - 1
         page = pdf[target_idx]
         
-        # 轉成圖片
-        image = page.render(scale=1.5).to_pil()
+        # 渲染整頁圖片
+        img = page.render(scale=2.0).to_pil()
+        w, h = img.size
+        
+        # 華安電傳「地址」大約位於所有權部表格的上方 30%~55% 處
+        # 進行針對性垂直範圍裁切，大幅縮小傳輸體積
+        crop_box = (int(w * 0.15), int(h * 0.30), int(w * 0.95), int(h * 0.58))
+        cropped_img = img.crop(crop_box)
+        
         img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format='JPEG', quality=85)
+        cropped_img.save(img_byte_arr, format='JPEG', quality=85)
         img_bytes = img_byte_arr.getvalue()
 
         client = genai.Client(api_key=api_key)
-        
-        # 極簡 Prompt，要求只讀地址那一欄
-        prompt = "請看這張建物所有權部圖片，精準讀出「地址」欄位中的文字。若有星號隱匿請回覆「隱匿」。請直接輸出地址本身，不要有其他字眼。"
+        prompt = "這是一張建物謄本局部截圖。請辨識圖中『地址』那一行所記載的地址。如果被星號隱匿請只回覆『隱匿』。請直接輸出地址內容，不要有其他任何文字。"
 
-        # 自動重試機制
         for attempt in range(3):
             try:
                 response = client.models.generate_content(
@@ -52,16 +57,14 @@ def ocr_address_only(file_bytes, page_index=1):
                     ]
                 )
                 res_text = response.text.strip()
-                # 剔除可能的多餘字元
-                res_text = res_text.replace("\n", "").replace("`", "")
-                return res_text if res_text else "隱匿"
+                res_text = res_text.replace("\n", "").replace("`", "").replace("地址", "").replace("：", "").replace(":", "").strip()
+                return res_text if len(res_text) > 1 else "隱匿"
             except Exception as e:
-                if attempt < 2:
-                    time.sleep(1.5)
-                    continue
-                return "AI辨識超時"
+                time.sleep(1.5)
+                continue
+        return "AI辨識超時"
     except Exception as e:
-        return "讀取錯誤"
+        return "辨識錯誤"
 
 def parse_transcript_fast(file):
     file_bytes = file.read()
@@ -100,7 +103,7 @@ def parse_transcript_fast(file):
         "戶籍地址": "抓取錯誤"
     }
 
-    # 1. 建物完整門牌 (補齊 臺南市東區 等)
+    # 1. 建物完整門牌
     city_district = ""
     region_match = re.search(r"([^\d\n\r\s]{2,3}(?:市|縣))\s*([^\d\n\r\s]{1,4}(?:區|鄉|鎮|市))", clean_full)
     if region_match:
@@ -122,13 +125,12 @@ def parse_transcript_fast(file):
         if any(c in raw_doorplate for c in ["市", "縣"]):
             data["建物門牌"] = raw_doorplate
         else:
-            prefix = city_district
             if region_match and region_match.group(2) in raw_doorplate:
                 data["建物門牌"] = f"{region_match.group(1)}{raw_doorplate}"
             else:
-                data["建物門牌"] = f"{prefix}{raw_doorplate}"
+                data["建物門牌"] = f"{city_district}{raw_doorplate}"
 
-    # 2. 面積計算 (主建、附屬、公設、總坪數)
+    # 2. 面積計算
     main_m2 = 0.0
     main_match = re.search(r"層次面積\s*([\d\.]+)\s*平方公尺", clean_full)
     if main_match:
@@ -161,24 +163,27 @@ def parse_transcript_fast(file):
     else:
         data["車位標示"] = parking_match.group(1).strip()
 
-    # 4. 所有權人姓名 + 稱謂 (1先生 / 2女士)
+    # 4. 所有權人姓名與性別 (強化跨行與電傳排版精準定位)
     owner_sec = clean_full
     owner_page_idx = 1
     for idx, pt in enumerate(pages_text):
-        if "建物所有權部" in pt:
+        if "所有權" in pt:
             owner_page_idx = idx
             owner_sec = pt
             break
 
+    # 姓氏提取：找「所有權人」這四個字之後的第一個中文字
     raw_name = ""
-    name_match = re.search(r"所有權人\s*\n\s*([^\n\r]+)", owner_sec)
-    if name_match:
-        raw_name = name_match.group(1).replace("*", "").strip()
+    # 支援：所有權人 王**、所有權人\n甘**
+    name_m = re.search(r"所有權人[：:\s\n]*([^\d\n\r\s\*]{1,3})[\*]*", owner_sec)
+    if name_m:
+        raw_name = name_m.group(1).strip()
 
+    # 性別判定：抓身分證第 2 碼（英文字母後的 1 或 2）
     title = ""
-    id_match = re.search(r"([A-Za-z])\s*([12])\s*[\d\*]{2,}", owner_sec)
-    if id_match:
-        code = id_match.group(2)
+    id_m = re.search(r"([A-Za-z])\s*([12])[\d\*]{2,}", owner_sec)
+    if id_m:
+        code = id_m.group(2)
         if code == "1":
             title = "先生"
         elif code == "2":
@@ -187,15 +192,27 @@ def parse_transcript_fast(file):
     if raw_name:
         data["所有權人"] = raw_name + title
 
-    # 5. 戶籍地址：精準只呼叫 AI 辨識第 2 頁的那行文字
-    data["戶籍地址"] = ocr_address_only(file_bytes, page_index=owner_page_idx)
+    # 5. 戶籍地址：先試本地是否有文字，若無則精準裁切送 AI
+    # 本地文字嘗試
+    local_addr_m = re.search(r"(?:地址|住址)[：:\s\n]*([^\n\r]+)", owner_sec)
+    got_local = False
+    if local_addr_m:
+        cand = local_addr_m.group(1).strip()
+        cand = re.split(r"(?:權利範圍|統一編號|權狀字號)", cand)[0].strip()
+        if any(w in cand for w in ["市", "縣", "鄉", "鎮", "區", "路", "街", "巷"]):
+            data["戶籍地址"] = cand
+            got_local = True
+
+    # 本地沒撈到正常地址，才啟動 AI 小圖裁切辨識
+    if not got_local:
+        data["戶籍地址"] = ocr_address_cropped(file_bytes, page_idx=owner_page_idx)
 
     return data
 
 # 介面展示
 if uploaded_files:
     results = []
-    with st.spinner(f"正在秒級整理 {len(uploaded_files)} 份謄本資料..."):
+    with st.spinner(f"正在精準解析 {len(uploaded_files)} 份物件資料..."):
         for f in uploaded_files:
             try:
                 info = parse_transcript_fast(f)
