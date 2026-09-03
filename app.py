@@ -12,7 +12,7 @@ import time
 st.set_page_config(page_title="房產精耕謄本助手", layout="wide")
 
 st.title("🏡 房產精耕小工具：謄本精準擷取")
-st.write("已強化：**所有權人稱謂鎖定**、**地址小區塊自動裁切極速辨識**！")
+st.write("已強化：**所有權人稱謂鎖定（徹底去除星號）**、**地址小區塊自動裁切極速辨識**！")
 
 # 讀取 API Key (優先從 Secrets 抓，若無則在側邊欄輸入)
 api_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -22,7 +22,7 @@ if not api_key:
 uploaded_files = st.file_uploader("請拖曳或上傳建物謄本/電傳 PDF (可複選多個)", type=["pdf"], accept_multiple_files=True)
 
 def ocr_address_cropped(file_bytes, page_idx=1):
-    """ 只裁切地址區域的小圖給 AI 辨識，速度提升 10 倍，避免超時 """
+    """ 只裁切地址區域的小圖給 AI 辨識，避免超時 """
     if not api_key:
         return "未填 API Key"
     
@@ -35,8 +35,7 @@ def ocr_address_cropped(file_bytes, page_idx=1):
         img = page.render(scale=2.0).to_pil()
         w, h = img.size
         
-        # 華安電傳「地址」大約位於所有權部表格的上方 30%~55% 處
-        # 進行針對性垂直範圍裁切，大幅縮小傳輸體積
+        # 針對性垂直範圍裁切
         crop_box = (int(w * 0.15), int(h * 0.30), int(w * 0.95), int(h * 0.58))
         cropped_img = img.crop(crop_box)
         
@@ -163,7 +162,7 @@ def parse_transcript_fast(file):
     else:
         data["車位標示"] = parking_match.group(1).strip()
 
-    # 4. 所有權人姓名與性別 (強化跨行與電傳排版精準定位)
+    # 4. 所有權人姓名與性別 (徹底去除所有 * 號)
     owner_sec = clean_full
     owner_page_idx = 1
     for idx, pt in enumerate(pages_text):
@@ -172,14 +171,11 @@ def parse_transcript_fast(file):
             owner_sec = pt
             break
 
-    # 姓氏提取：找「所有權人」這四個字之後的第一個中文字
     raw_name = ""
-    # 支援：所有權人 王**、所有權人\n甘**
-    name_m = re.search(r"所有權人[：:\s\n]*([^\d\n\r\s\*]{1,3})[\*]*", owner_sec)
+    name_m = re.search(r"所有權人[：:\s\n]*([^\d\n\r\s]+)", owner_sec)
     if name_m:
-        raw_name = name_m.group(1).strip()
+        raw_name = re.sub(r"[\*]+", "", name_m.group(1)).strip()
 
-    # 性別判定：抓身分證第 2 碼（英文字母後的 1 或 2）
     title = ""
     id_m = re.search(r"([A-Za-z])\s*([12])[\d\*]{2,}", owner_sec)
     if id_m:
@@ -193,7 +189,6 @@ def parse_transcript_fast(file):
         data["所有權人"] = raw_name + title
 
     # 5. 戶籍地址：先試本地是否有文字，若無則精準裁切送 AI
-    # 本地文字嘗試
     local_addr_m = re.search(r"(?:地址|住址)[：:\s\n]*([^\n\r]+)", owner_sec)
     got_local = False
     if local_addr_m:
@@ -203,7 +198,6 @@ def parse_transcript_fast(file):
             data["戶籍地址"] = cand
             got_local = True
 
-    # 本地沒撈到正常地址，才啟動 AI 小圖裁切辨識
     if not got_local:
         data["戶籍地址"] = ocr_address_cropped(file_bytes, page_idx=owner_page_idx)
 
