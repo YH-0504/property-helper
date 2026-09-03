@@ -9,43 +9,72 @@ import io
 
 st.set_page_config(page_title="房產精耕謄本助手", layout="wide")
 
-st.title("🏡 房產精耕小工具：謄本精準擷取 (開源離線版)")
-st.write("已全面改用**本地開源 Tesseract 繁中辨識**：免 API Key、秒級辨識、永不塞車！")
+st.title("🏡 房產精耕小工具：謄本精準擷取 (座標精確鎖定版)")
+st.write("已改用**『地址』關鍵字精準座標鎖定**，徹底解決抓到頁尾雜訊問題，並清除全半形星號！")
 
 uploaded_files = st.file_uploader("請拖曳或上傳建物謄本/電傳 PDF (可複選多個)", type=["pdf"], accept_multiple_files=True)
 
-def ocr_address_local(file_bytes, page_idx=1):
-    """ 本地精準裁切地址欄位並使用繁體中文 OCR 辨識 """
+def get_address_by_coordinates(file_bytes, page_idx=1):
+    """ 利用『地址』文字座標精確定位右側區域進行 OCR """
     try:
-        pdf = pdfium.PdfDocument(file_bytes)
-        target_idx = page_idx if len(pdf) > page_idx else len(pdf) - 1
-        page = pdf[target_idx]
+        # 1. 透過 pdfplumber 尋找第 2 頁「地址」標籤的精確座標 (x0, top, x1, bottom)
+        addr_box = None
+        pdf_stream = io.BytesIO(file_bytes)
+        with pdfplumber.open(pdf_stream) as pdf:
+            target_p = pdf.pages[page_idx] if len(pdf.pages) > page_idx else pdf.pages[-1]
+            page_w = target_p.width
+            page_h = target_p.height
+            
+            # 尋找所有包含「地」或「址」的字元或字詞
+            words = target_p.extract_words()
+            for w in words:
+                if "地址" in w["text"] or "住址" in w["text"]:
+                    addr_box = w
+                    break
         
-        # 放大渲染圖片以提高 OCR 辨識率
-        img = page.render(scale=3.0).to_pil()
-        w, h = img.size
+        # 2. 用 pypdfium2 渲染高解析圖片
+        pdf_doc = pdfium.PdfDocument(file_bytes)
+        target_p_img = pdf_doc[page_idx if len(pdf_doc) > page_idx else len(pdf_doc) - 1]
+        scale = 3.0
+        pil_img = target_p_img.render(scale=scale).to_pil()
+        img_w, img_h = pil_img.size
+
+        # 3. 計算精確裁切區域
+        if addr_box:
+            # 如果找到「地址」兩字，取它右邊整條（寬度到表格邊界，高度取該列的高度略微放寬）
+            scale_x = img_w / page_w
+            scale_y = img_h / page_h
+            
+            x0 = int(addr_box["x1"] * scale_x) + 5  # 地址標籤右邊界再往右一點
+            y0 = int((addr_box["top"] - 3) * scale_y)  # 稍微往上抓一點點
+            x1 = int(img_w * 0.92)  # 抓到右邊框線前
+            y1 = int((addr_box["bottom"] + 5) * scale_y) # 抓取此列高度
+            crop_rect = (x0, y0, x1, y1)
+        else:
+            # 備用保底定位（中間右側）
+            crop_rect = (int(img_w * 0.22), int(img_h * 0.28), int(img_w * 0.90), int(img_h * 0.45))
+
+        cropped = pil_img.crop(crop_rect)
         
-        # 針對華安電傳「地址」區域進行垂直與水平裁切
-        crop_box = (int(w * 0.22), int(h * 0.35), int(w * 0.95), int(h * 0.55))
-        cropped_img = img.crop(crop_box)
+        # 4. 影像強化與繁中辨識
+        gray = cropped.convert('L')
+        # 二值化處理：將底色變純白、文字變純黑
+        bw = gray.point(lambda x: 0 if x < 180 else 255, '1')
         
-        # 轉為灰階提高字元對比
-        gray_img = cropped_img.convert('L')
-        
-        # 本地呼叫 Tesseract 繁體中文識別
-        text = pytesseract.image_to_string(gray_img, lang='chi_tra+eng', config='--psm 6')
-        
-        # 清理換行與多餘符號
+        text = pytesseract.image_to_string(bw, lang='chi_tra+eng', config='--psm 7')
         clean_text = re.sub(r"[\s\|\r\n]+", "", text)
         
-        # 檢查是否為隱匿
-        if "***" in clean_text or "隱匿" in clean_text:
+        # 剔除誤抓的文字標籤雜訊
+        clean_text = re.sub(r"^(?:地址|住址)[：:\s]*", "", clean_text)
+        
+        if any(star in clean_text for star in ["***", "＊＊＊"]) or "隱匿" in clean_text:
             return "隱匿"
         
-        # 若辨識出包含台灣地址特徵字樣
-        if any(c in clean_text for c in ["市", "縣", "區", "鄉", "鎮", "路", "街", "巷", "號"]):
+        # 只要抓到至少3個字且排除頁首頁尾關鍵字
+        if len(clean_text) >= 4 and not any(k in clean_text for k in ["查詢時間", "資料來源", "登記次序", "權利範圍"]):
             return clean_text
-        return clean_text if len(clean_text) > 3 else "隱匿"
+            
+        return "隱匿"
     except Exception as e:
         return "辨識錯誤"
 
@@ -61,7 +90,7 @@ def parse_transcript_fast(file):
 
     full_text = "\n".join(pages_text)
 
-    # 全形英數轉半形
+    # 全形英數與標點標準化轉換
     half_text = ""
     for char in full_text:
         code = ord(char)
@@ -86,7 +115,7 @@ def parse_transcript_fast(file):
         "戶籍地址": "抓取錯誤"
     }
 
-    # 1. 建物完整門牌 (補齊 臺南市東區 等)
+    # 1. 建物門牌 (完整組合)
     city_district = ""
     region_match = re.search(r"([^\d\n\r\s]{2,3}(?:市|縣))\s*([^\d\n\r\s]{1,4}(?:區|鄉|鎮|市))", clean_full)
     if region_match:
@@ -113,7 +142,7 @@ def parse_transcript_fast(file):
             else:
                 data["建物門牌"] = f"{city_district}{raw_doorplate}"
 
-    # 2. 面積計算 (m² * 0.3025)
+    # 2. 面積計算 (坪數換算)
     main_m2 = 0.0
     main_match = re.search(r"層次面積\s*([\d\.]+)\s*平方公尺", clean_full)
     if main_match:
@@ -146,7 +175,7 @@ def parse_transcript_fast(file):
     else:
         data["車位標示"] = parking_match.group(1).strip()
 
-    # 4. 所有權人姓名與稱謂 (去除所有 * 號)
+    # 4. 所有權人姓名與性別 (徹底清除半形與全形星號)
     owner_sec = clean_full
     owner_page_idx = 1
     for idx, pt in enumerate(pages_text):
@@ -158,10 +187,11 @@ def parse_transcript_fast(file):
     raw_name = ""
     name_m = re.search(r"所有權人[：:\s\n]*([^\d\n\r\s]+)", owner_sec)
     if name_m:
-        raw_name = re.sub(r"[\*]+", "", name_m.group(1)).strip()
+        # 同時移除半形 '*' 與全形 '＊'
+        raw_name = re.sub(r"[\*＊]+", "", name_m.group(1)).strip()
 
     title = ""
-    id_m = re.search(r"([A-Za-z])\s*([12])[\d\*]{2,}", owner_sec)
+    id_m = re.search(r"([A-Za-z])\s*([12])[\d\*＊]{2,}", owner_sec)
     if id_m:
         code = id_m.group(2)
         if code == "1":
@@ -172,15 +202,15 @@ def parse_transcript_fast(file):
     if raw_name:
         data["所有權人"] = raw_name + title
 
-    # 5. 戶籍地址：優先由本地 Tesseract 辨識裁切小圖
-    data["戶籍地址"] = ocr_address_local(file_bytes, page_idx=owner_page_idx)
+    # 5. 戶籍地址 (透過文字座標精準鎖定)
+    data["戶籍地址"] = get_address_by_coordinates(file_bytes, page_idx=owner_page_idx)
 
     return data
 
 # 介面展示
 if uploaded_files:
     results = []
-    with st.spinner(f"正在本地快速解析 {len(uploaded_files)} 份物件資料..."):
+    with st.spinner(f"正在透過座標定位解析 {len(uploaded_files)} 份物件資料..."):
         for f in uploaded_files:
             try:
                 info = parse_transcript_fast(f)
