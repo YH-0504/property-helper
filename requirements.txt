@@ -1,4 +1,6 @@
 streamlit
+pdfplumber
 google-genai
 pandas
-pydantic
+pypdfium2
+Pillow
