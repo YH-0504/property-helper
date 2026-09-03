@@ -8,8 +8,8 @@ import time
 
 st.set_page_config(page_title="房產精耕謄本助手", layout="wide")
 
-st.title("🏡 房產精耕小工具：謄本精準擷取 (正式穩定版)")
-st.write("透過多模態 AI 直接讀取謄本 PDF，自動辨識圖片戶籍地址、計算坪數與判斷稱謂！")
+st.title("🏡 房產精耕小工具：謄本精準擷取")
+st.write("透過多模態 AI 自動辨識圖片戶籍地址、計算坪數、抓取車位與判斷稱謂！")
 
 # 讀取 API Key (優先從 Secrets 抓，若無則在側邊欄輸入)
 api_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -46,11 +46,12 @@ def extract_with_gemini(file_bytes, filename):
     5. 戶籍地址：位於「建物所有權部」的「地址」欄位（注意：即使該欄位在 PDF 中為嵌入圖片，也請進行 OCR 精準識別出完整縣市市區路名門牌）。若被星號遮蔽則填「隱匿」。
     """
 
-    # 官方指定最新標準 flash 模型
-    target_model = 'gemini-2.5-flash'
+    # 官方指定模型
+    target_model = 'gemini-3.6-flash'
     
-    # 設置自動重試（應對伺服器尖峰 503 暫時塞車）
-    for attempt in range(3):
+    # 指數退避重試邏輯（若遇 503 伺服器尖峰，自動等待並重試最多 4 次）
+    max_retries = 4
+    for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
                 model=target_model,
@@ -79,9 +80,13 @@ def extract_with_gemini(file_bytes, filename):
                 "戶籍地址": res_dict.get("res_address", "未識別")
             }
         except Exception as e:
-            if attempt < 2:
-                time.sleep(2 * (attempt + 1))  # 依序等待 2秒、4秒後重試
-                continue
+            # 若為伺服器忙碌 (503)，等待後重試
+            if "503" in str(e) or "UNAVAILABLE" in str(e):
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 3  # 3秒, 6秒, 9秒
+                    time.sleep(wait_time)
+                    continue
+            # 其他錯誤直接拋出
             raise e
 
 if uploaded_files:
