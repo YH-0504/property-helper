@@ -5,8 +5,8 @@ import pandas as pd
 
 st.set_page_config(page_title="房產精耕謄本助手 Pro", layout="wide")
 
-st.title("🏡 房產精耕小工具：建物電傳/謄本自動解析 (實務強化版)")
-st.write("已加入**稱謂自動合併（去除星號）**與**地址隱匿/錯誤狀態偵測**，支援多檔批次匯出！")
+st.title("🏡 房產精耕小工具：建物電傳/謄本自動解析 (實務修復版)")
+st.write("已修正**完整門牌自動拼接（補上縣市區）**與**戶籍地址精準截取（排除權利範圍）**！")
 
 uploaded_files = st.file_uploader("請拖曳或上傳建物謄本/電傳 PDF (可複選)", type=["pdf"], accept_multiple_files=True)
 
@@ -27,7 +27,7 @@ def parse_transcript_pdf(file):
     data = {
         "檔名": getattr(file, "name", "未知"),
         "縣市行政區": "",
-        "建物門牌": "未識別",
+        "建物完整門牌": "未識別",
         "建號": "未識別",
         "建物總坪數": 0.0,
         "主建物(坪)": 0.0,
@@ -42,26 +42,44 @@ def parse_transcript_pdf(file):
         "主要建材": "未識別"
     }
 
-    # 1. 行政區段與建號
-    sec_match = re.search(r"([^\n\r]+(?:市|縣)[^\n\r]+(?:區|鄉|鎮|市)[^\n\r]+(?:段|小段))\s*([0-9\-]+)\s*建號", full_clean)
+    # 1. 抓取「縣市 + 鄉鎮市區 + 段名」與「建號」
+    city_district = ""
+    sec_match = re.search(r"([^\n\r\s]+(?:市|縣)[^\n\r\s]+(?:區|鄉|鎮|市))([^\n\r\s]+(?:段|小段))?\s*([0-9\-]+)\s*建號", full_clean)
     if sec_match:
-        data["縣市行政區"] = sec_match.group(1).strip()
-        data["建號"] = sec_match.group(2).strip()
+        city_district = sec_match.group(1).strip()
+        data["縣市行政區"] = (sec_match.group(1) + (sec_match.group(2) or "")).strip()
+        data["建號"] = sec_match.group(3).strip()
     else:
+        # 備用抓法：直接尋找 臺南市XX區 或 台灣常見縣市區
+        alt_city = re.search(r"([^\n\r\s]+(?:市|縣)[^\n\r\s]+(?:區|鄉|鎮|市))", full_clean)
+        if alt_city:
+            city_district = alt_city.group(1).strip()
+            data["縣市行政區"] = city_district
+        
         no_m = re.search(r"建\s*號[：:\s]*([0-9\-]+)", full_clean)
         if no_m:
             data["建號"] = no_m.group(1).strip()
 
     # 2. 標題下一行掃描（門牌、日期、用途、建材）
+    raw_doorplate = ""
     for i, line in enumerate(lines):
         if "建物門牌" in line and i + 1 < len(lines):
-            data["建物門牌"] = lines[i+1].replace("|", "").strip()
+            raw_doorplate = lines[i+1].replace("|", "").strip()
         if "建築完成日期" in line and i + 1 < len(lines):
             data["建築完成日"] = lines[i+1].replace("|", "").strip()
         if "主要用途" in line and i + 1 < len(lines):
             data["主要用途"] = lines[i+1].replace("|", "").strip()
         if "主要建材" in line and i + 1 < len(lines):
             data["主要建材"] = lines[i+1].replace("|", "").strip()
+
+    # 組合完整門牌（若門牌本身沒有縣市字樣，自動補上開頭的縣市行政區）
+    if raw_doorplate:
+        if any(c in raw_doorplate for c in ["市", "縣"]):
+            data["建物完整門牌"] = raw_doorplate
+        else:
+            data["建物完整門牌"] = f"{city_district}{raw_doorplate}"
+    else:
+        data["建物完整門牌"] = "未識別"
 
     # 3. 面積計算 (m² * 0.3025)
     main_m2 = 0.0
@@ -102,28 +120,32 @@ def parse_transcript_pdf(file):
     if owner_m:
         raw_owner = owner_m.group(1).replace("*", "").strip()
 
-    # (B) 統一編號 / 身分證字號性別判斷
+    # (B) 統一編號 / 身分證字號性別判斷（精準匹配英文字母 + 1或2 + 後續）
     title_suffix = ""
-    id_m = re.search(r"(?:統一\s*編號|統編|身分證字號)[：:\s]*([A-Za-z])(\d)[0-9\*]+", owner_sec)
+    id_m = re.search(r"([A-Za-z])\s*([12])\s*[\d\*]{2,}", owner_sec)
     if id_m:
         first_digit = id_m.group(2)
         if first_digit == "1":
             title_suffix = "先生"
         elif first_digit == "2":
             title_suffix = "女士"
-    
+
     if raw_owner != "未識別":
         data["所有權人"] = raw_owner + title_suffix
     else:
         data["所有權人"] = "未識別"
 
-    # (C) 戶籍/登記地址判斷（偵測是否隱匿或抓取錯誤）
-    addr_m = re.search(r"(?:地址|住址)\s*([^\n\r]+)", owner_sec)
+    # (C) 戶籍/登記地址判斷（精準截斷，去除「權利範圍 全部1分之1」雜訊）
+    addr_m = re.search(r"(?:地址|住址)\s*[:：\s]*([^\n\r]+)", owner_sec)
     if addr_m:
         extracted_addr = addr_m.group(1).strip()
+        
+        # 移除可能被誤帶入的「權利範圍...」、「全部...」等字眼
+        extracted_addr = re.split(r"(?:權利範圍|統一編號|權狀字號)", extracted_addr)[0].strip()
+
         if "***" in extracted_addr or "隱匿" in extracted_addr:
             data["登記住址"] = "隱匿"
-        elif len(extracted_addr) > 0:
+        elif len(extracted_addr) > 2:
             data["登記住址"] = extracted_addr
         else:
             data["登記住址"] = "抓取錯誤"
@@ -160,7 +182,7 @@ if uploaded_files:
         df = pd.DataFrame(results)
 
         col_order = [
-            "縣市行政區", "建物門牌", "建物總坪數", "主建物(坪)", "附屬陽台(坪)", "公設坪數",
+            "建物完整門牌", "縣市行政區", "建物總坪數", "主建物(坪)", "附屬陽台(坪)", "公設坪數",
             "所有權人", "登記住址", "登記原因", "登記日期", "建築完成日", "主要用途", "主要建材", "建號", "檔名"
         ]
         df = df[[c for c in col_order if c in df.columns]]
