@@ -1,67 +1,51 @@
 import streamlit as st
 import pdfplumber
 import pypdfium2 as pdfium
-from google import genai
-from google.genai import types
+import pytesseract
 from PIL import Image
 import re
 import pandas as pd
 import io
-import time
 
 st.set_page_config(page_title="房產精耕謄本助手", layout="wide")
 
-st.title("🏡 房產精耕小工具：謄本精準擷取")
-st.write("已強化：**所有權人稱謂鎖定（徹底去除星號）**、**地址小區塊自動裁切極速辨識**！")
-
-# 讀取 API Key (優先從 Secrets 抓，若無則在側邊欄輸入)
-api_key = st.secrets.get("GEMINI_API_KEY", "")
-if not api_key:
-    api_key = st.sidebar.text_input("請輸入 Google Gemini API Key", type="password")
+st.title("🏡 房產精耕小工具：謄本精準擷取 (開源離線版)")
+st.write("已全面改用**本地開源 Tesseract 繁中辨識**：免 API Key、秒級辨識、永不塞車！")
 
 uploaded_files = st.file_uploader("請拖曳或上傳建物謄本/電傳 PDF (可複選多個)", type=["pdf"], accept_multiple_files=True)
 
-def ocr_address_cropped(file_bytes, page_idx=1):
-    """ 只裁切地址區域的小圖給 AI 辨識，避免超時 """
-    if not api_key:
-        return "未填 API Key"
-    
+def ocr_address_local(file_bytes, page_idx=1):
+    """ 本地精準裁切地址欄位並使用繁體中文 OCR 辨識 """
     try:
         pdf = pdfium.PdfDocument(file_bytes)
         target_idx = page_idx if len(pdf) > page_idx else len(pdf) - 1
         page = pdf[target_idx]
         
-        # 渲染整頁圖片
-        img = page.render(scale=2.0).to_pil()
+        # 放大渲染圖片以提高 OCR 辨識率
+        img = page.render(scale=3.0).to_pil()
         w, h = img.size
         
-        # 針對性垂直範圍裁切
-        crop_box = (int(w * 0.15), int(h * 0.30), int(w * 0.95), int(h * 0.58))
+        # 針對華安電傳「地址」區域進行垂直與水平裁切
+        crop_box = (int(w * 0.22), int(h * 0.35), int(w * 0.95), int(h * 0.55))
         cropped_img = img.crop(crop_box)
         
-        img_byte_arr = io.BytesIO()
-        cropped_img.save(img_byte_arr, format='JPEG', quality=85)
-        img_bytes = img_byte_arr.getvalue()
-
-        client = genai.Client(api_key=api_key)
-        prompt = "這是一張建物謄本局部截圖。請辨識圖中『地址』那一行所記載的地址。如果被星號隱匿請只回覆『隱匿』。請直接輸出地址內容，不要有其他任何文字。"
-
-        for attempt in range(3):
-            try:
-                response = client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=[
-                        types.Part.from_bytes(data=img_bytes, mime_type='image/jpeg'),
-                        prompt
-                    ]
-                )
-                res_text = response.text.strip()
-                res_text = res_text.replace("\n", "").replace("`", "").replace("地址", "").replace("：", "").replace(":", "").strip()
-                return res_text if len(res_text) > 1 else "隱匿"
-            except Exception as e:
-                time.sleep(1.5)
-                continue
-        return "AI辨識超時"
+        # 轉為灰階提高字元對比
+        gray_img = cropped_img.convert('L')
+        
+        # 本地呼叫 Tesseract 繁體中文識別
+        text = pytesseract.image_to_string(gray_img, lang='chi_tra+eng', config='--psm 6')
+        
+        # 清理換行與多餘符號
+        clean_text = re.sub(r"[\s\|\r\n]+", "", text)
+        
+        # 檢查是否為隱匿
+        if "***" in clean_text or "隱匿" in clean_text:
+            return "隱匿"
+        
+        # 若辨識出包含台灣地址特徵字樣
+        if any(c in clean_text for c in ["市", "縣", "區", "鄉", "鎮", "路", "街", "巷", "號"]):
+            return clean_text
+        return clean_text if len(clean_text) > 3 else "隱匿"
     except Exception as e:
         return "辨識錯誤"
 
@@ -77,7 +61,7 @@ def parse_transcript_fast(file):
 
     full_text = "\n".join(pages_text)
 
-    # 全形轉半形
+    # 全形英數轉半形
     half_text = ""
     for char in full_text:
         code = ord(char)
@@ -102,7 +86,7 @@ def parse_transcript_fast(file):
         "戶籍地址": "抓取錯誤"
     }
 
-    # 1. 建物完整門牌
+    # 1. 建物完整門牌 (補齊 臺南市東區 等)
     city_district = ""
     region_match = re.search(r"([^\d\n\r\s]{2,3}(?:市|縣))\s*([^\d\n\r\s]{1,4}(?:區|鄉|鎮|市))", clean_full)
     if region_match:
@@ -129,7 +113,7 @@ def parse_transcript_fast(file):
             else:
                 data["建物門牌"] = f"{city_district}{raw_doorplate}"
 
-    # 2. 面積計算
+    # 2. 面積計算 (m² * 0.3025)
     main_m2 = 0.0
     main_match = re.search(r"層次面積\s*([\d\.]+)\s*平方公尺", clean_full)
     if main_match:
@@ -162,7 +146,7 @@ def parse_transcript_fast(file):
     else:
         data["車位標示"] = parking_match.group(1).strip()
 
-    # 4. 所有權人姓名與性別 (徹底去除所有 * 號)
+    # 4. 所有權人姓名與稱謂 (去除所有 * 號)
     owner_sec = clean_full
     owner_page_idx = 1
     for idx, pt in enumerate(pages_text):
@@ -188,25 +172,15 @@ def parse_transcript_fast(file):
     if raw_name:
         data["所有權人"] = raw_name + title
 
-    # 5. 戶籍地址：先試本地是否有文字，若無則精準裁切送 AI
-    local_addr_m = re.search(r"(?:地址|住址)[：:\s\n]*([^\n\r]+)", owner_sec)
-    got_local = False
-    if local_addr_m:
-        cand = local_addr_m.group(1).strip()
-        cand = re.split(r"(?:權利範圍|統一編號|權狀字號)", cand)[0].strip()
-        if any(w in cand for w in ["市", "縣", "鄉", "鎮", "區", "路", "街", "巷"]):
-            data["戶籍地址"] = cand
-            got_local = True
-
-    if not got_local:
-        data["戶籍地址"] = ocr_address_cropped(file_bytes, page_idx=owner_page_idx)
+    # 5. 戶籍地址：優先由本地 Tesseract 辨識裁切小圖
+    data["戶籍地址"] = ocr_address_local(file_bytes, page_idx=owner_page_idx)
 
     return data
 
 # 介面展示
 if uploaded_files:
     results = []
-    with st.spinner(f"正在精準解析 {len(uploaded_files)} 份物件資料..."):
+    with st.spinner(f"正在本地快速解析 {len(uploaded_files)} 份物件資料..."):
         for f in uploaded_files:
             try:
                 info = parse_transcript_fast(f)
@@ -215,7 +189,7 @@ if uploaded_files:
                 st.error(f"檔案 {f.name} 處理失敗：{e}")
 
     if results:
-        st.success(f"✅ 成功整理 {len(results)} 筆資料！")
+        st.success(f"✅ 成功整理 {len(results)} 筆精耕資料！")
         df = pd.DataFrame(results)
 
         columns_to_show = [
