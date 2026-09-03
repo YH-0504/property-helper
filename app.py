@@ -1,15 +1,17 @@
 import streamlit as st
+import pdfplumber
+import pypdfium2 as pdfium
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
+import re
 import pandas as pd
-import json
+import io
 import time
 
 st.set_page_config(page_title="房產精耕謄本助手", layout="wide")
 
-st.title("🏡 房產精耕小工具：謄本精準擷取")
-st.write("透過多模態 AI 自動辨識圖片戶籍地址、計算坪數、抓取車位與判斷稱謂！")
+st.title("🏡 房產精耕小工具：謄本精準擷取 (輕量混合高速版)")
+st.write("坪數與門牌由本地極速處理，**AI 僅專注辨識第 2 頁戶籍地址**，大幅縮短運算時間！")
 
 # 讀取 API Key (優先從 Secrets 抓，若無則在側邊欄輸入)
 api_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -18,108 +20,206 @@ if not api_key:
 
 uploaded_files = st.file_uploader("請拖曳或上傳建物謄本/電傳 PDF (可複選多個)", type=["pdf"], accept_multiple_files=True)
 
-class PropertyInfo(BaseModel):
-    doorplate: str = Field(description="建物完整門牌，必須補齊縣市行政區，例如：臺南市東區東安路12巷22之3號")
-    total_area: float = Field(description="總坪數（主建物+附屬+公設，若原載為平方公尺請乘0.3025換算為坪數）")
-    main_area: float = Field(description="主建物坪數（層次面積換算為坪數）")
-    sub_area: float = Field(description="附屬建物坪數（陽台、露台、雨遮等加總換算為坪數）")
-    pub_area: float = Field(description="公設坪數（各筆共有部分面積乘持分後換算為坪數加總）")
-    parking: str = Field(description="車位編號或標示，若無則填「無/未標示」")
-    owner_name: str = Field(description="所有權人稱謂，例如：甘女士、王先生。去掉星號，並依統編身分證第一碼數字1判斷先生、2判斷女士")
-    res_address: str = Field(description="所有權人的戶籍地址（建物所有權部裡的地址，若為圖片請精準辨識；若為星號則填「隱匿」）")
-
-def extract_with_gemini(file_bytes, filename):
-    client = genai.Client(api_key=api_key)
-    
-    prompt = """
-    你是一位專業的台灣不動產專家。請審閱這份建物謄本（或地政電傳）PDF，精準提取以下 5 大資訊：
-    1. 建物完整門牌：請結合文件標頭的縣市行政區（如臺南市東區）與門牌號碼，拼成完整地址。
-    2. 坪數拆解（請全部換算為「坪」，平方公尺 * 0.3025）：
-       - 主建物坪數（層次面積）
-       - 附屬坪數（陽台、露台、雨遮加總）
-       - 公設坪數（各筆共有部分建號之持分面積加總）
-       - 總坪數（主建物 + 附屬 + 公設）
-    3. 車位標示：若共有部分備註或其他登記事項有標註車位號（如 B4-105），請抓出；若無則填「無/未標示」。
-    4. 所有權人姓名與稱謂：
-       - 去除遮蔽星號（例如「甘**」轉為「甘」）。
-       - 依統一編號/身分證字號第二碼（即英文後的第一位數字）：1 為「先生」、2 為「女士」。組合成「甘女士」或「王先生」。
-    5. 戶籍地址：位於「建物所有權部」的「地址」欄位（注意：即使該欄位在 PDF 中為嵌入圖片，也請進行 OCR 精準識別出完整縣市市區路名門牌）。若被星號遮蔽則填「隱匿」。
-    """
-
-    # 官方指定模型
-    target_model = 'gemini-3.6-flash'
-    
-    # 指數退避重試邏輯（若遇 503 伺服器尖峰，自動等待並重試最多 4 次）
-    max_retries = 4
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=target_model,
-                contents=[
-                    types.Part.from_bytes(
-                        data=file_bytes,
-                        mime_type='application/pdf'
-                    ),
-                    prompt
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=PropertyInfo,
-                    temperature=0.1
-                )
-            )
-            res_dict = json.loads(response.text)
-            return {
-                "建物門牌": res_dict.get("doorplate", "未識別"),
-                "總坪數": round(float(res_dict.get("total_area", 0.0)), 2),
-                "主建物(坪)": round(float(res_dict.get("main_area", 0.0)), 2),
-                "附屬(坪)": round(float(res_dict.get("sub_area", 0.0)), 2),
-                "公設(坪)": round(float(res_dict.get("pub_area", 0.0)), 2),
-                "車位標示": res_dict.get("parking", "無/未標示"),
-                "所有權人": res_dict.get("owner_name", "未識別"),
-                "戶籍地址": res_dict.get("res_address", "未識別")
-            }
-        except Exception as e:
-            # 若為伺服器忙碌 (503)，等待後重試
-            if "503" in str(e) or "UNAVAILABLE" in str(e):
-                if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 3  # 3秒, 6秒, 9秒
-                    time.sleep(wait_time)
-                    continue
-            # 其他錯誤直接拋出
-            raise e
-
-if uploaded_files:
+def ocr_address_only(file_bytes, page_index=1):
+    """ 只將第 2 頁（索引為1）轉成圖片送給 AI 辨識地址那一欄 """
     if not api_key:
-        st.error("⚠️ 請先在左側欄輸入 Gemini API Key，或在 Streamlit Secrets 中設定！")
+        return "未填 API Key"
+    
+    try:
+        pdf = pdfium.PdfDocument(file_bytes)
+        target_idx = page_index if len(pdf) > page_index else len(pdf) - 1
+        page = pdf[target_idx]
+        
+        # 轉成圖片
+        image = page.render(scale=1.5).to_pil()
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format='JPEG', quality=85)
+        img_bytes = img_byte_arr.getvalue()
+
+        client = genai.Client(api_key=api_key)
+        
+        # 極簡 Prompt，要求只讀地址那一欄
+        prompt = "請看這張建物所有權部圖片，精準讀出「地址」欄位中的文字。若有星號隱匿請回覆「隱匿」。請直接輸出地址本身，不要有其他字眼。"
+
+        # 自動重試機制
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=[
+                        types.Part.from_bytes(data=img_bytes, mime_type='image/jpeg'),
+                        prompt
+                    ]
+                )
+                res_text = response.text.strip()
+                # 剔除可能的多餘字元
+                res_text = res_text.replace("\n", "").replace("`", "")
+                return res_text if res_text else "隱匿"
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(1.5)
+                    continue
+                return "AI辨識超時"
+    except Exception as e:
+        return "讀取錯誤"
+
+def parse_transcript_fast(file):
+    file_bytes = file.read()
+    file_stream = io.BytesIO(file_bytes)
+
+    pages_text = []
+    with pdfplumber.open(file_stream) as pdf:
+        for p in pdf.pages:
+            t = p.extract_text()
+            pages_text.append(t if t else "")
+
+    full_text = "\n".join(pages_text)
+
+    # 全形轉半形
+    half_text = ""
+    for char in full_text:
+        code = ord(char)
+        if 0xFF01 <= code <= 0xFF5E:
+            half_text += chr(code - 0xFEE0)
+        elif code == 0x3000:
+            half_text += " "
+        else:
+            half_text += char
+
+    clean_full = re.sub(r"[\|\t]", " ", half_text)
+    lines = [re.sub(r"\s+", " ", line).strip() for line in clean_full.split("\n") if line.strip()]
+
+    data = {
+        "建物門牌": "未識別",
+        "總坪數": 0.0,
+        "主建物(坪)": 0.0,
+        "附屬(坪)": 0.0,
+        "公設(坪)": 0.0,
+        "車位標示": "無/未標示",
+        "所有權人": "未識別",
+        "戶籍地址": "抓取錯誤"
+    }
+
+    # 1. 建物完整門牌 (補齊 臺南市東區 等)
+    city_district = ""
+    region_match = re.search(r"([^\d\n\r\s]{2,3}(?:市|縣))\s*([^\d\n\r\s]{1,4}(?:區|鄉|鎮|市))", clean_full)
+    if region_match:
+        city_district = region_match.group(1).replace(" ", "") + region_match.group(2).replace(" ", "")
+
+    raw_doorplate = ""
+    for i, line in enumerate(lines):
+        if "建物門牌" in line:
+            after_label = re.sub(r"^.*?建物門牌[：:\s]*", "", line).strip()
+            if len(after_label) > 1:
+                raw_doorplate = after_label
+                break
+            elif i + 1 < len(lines):
+                raw_doorplate = lines[i+1].strip()
+                break
+
+    raw_doorplate = raw_doorplate.replace(" ", "")
+    if raw_doorplate:
+        if any(c in raw_doorplate for c in ["市", "縣"]):
+            data["建物門牌"] = raw_doorplate
+        else:
+            prefix = city_district
+            if region_match and region_match.group(2) in raw_doorplate:
+                data["建物門牌"] = f"{region_match.group(1)}{raw_doorplate}"
+            else:
+                data["建物門牌"] = f"{prefix}{raw_doorplate}"
+
+    # 2. 面積計算 (主建、附屬、公設、總坪數)
+    main_m2 = 0.0
+    main_match = re.search(r"層次面積\s*([\d\.]+)\s*平方公尺", clean_full)
+    if main_match:
+        main_m2 = float(main_match.group(1))
+    data["主建物(坪)"] = round(main_m2 * 0.3025, 2)
+
+    sub_m2 = 0.0
+    sub_matches = re.findall(r"(?:陽台|露台|雨遮|平台|花台)[^\d\n\r]*?面積\s*([\d\.]+)\s*平方公尺", clean_full)
+    if sub_matches:
+        sub_m2 = sum([float(m) for m in sub_matches])
+    data["附屬(坪)"] = round(sub_m2 * 0.3025, 2)
+
+    pub_m2 = 0.0
+    linear_text = clean_full.replace("\n", " ")
+    pub_matches = re.findall(r"建號\s*([\d\.]+)\s*平方公\s*尺.*?權利範圍\s*(\d+)\s*分之\s*(\d+)", linear_text)
+    for p_area, denom, numer in pub_matches:
+        try:
+            pub_m2 += float(p_area) * (float(numer) / float(denom))
+        except:
+            pass
+    data["公設(坪)"] = round(pub_m2 * 0.3025, 2)
+    data["總坪數"] = round(data["主建物(坪)"] + data["附屬(坪)"] + data["公設(坪)"], 2)
+
+    # 3. 車位標示
+    parking_match = re.search(r"(?:編號|車位)[：:\s]*([A-Za-z0-9\-\_]+号|[A-Za-z0-9\-\_]+號|[B|b]\d+[\s\-]*(?:號)?\d*)", clean_full)
+    if not parking_match:
+        parking_match = re.search(r"(地下一層|地下二層|地下三層|地下四層|地下五層|B[1-5])[^\n\r]*?(?:車位|編號)[：:\s]*([^\n\r\s]+)", clean_full)
+        if parking_match:
+            data["車位標示"] = f"{parking_match.group(1)} {parking_match.group(2)}"
     else:
-        results = []
-        with st.spinner(f"正在透過 AI 解析 {len(uploaded_files)} 份謄本資料..."):
-            for f in uploaded_files:
-                try:
-                    f_bytes = f.read()
-                    data = extract_with_gemini(f_bytes, f.name)
-                    results.append(data)
-                except Exception as e:
-                    st.error(f"檔案 {f.name} 處理失敗：{e}")
+        data["車位標示"] = parking_match.group(1).strip()
 
-        if results:
-            st.success(f"✅ 成功整理 {len(results)} 筆資料！")
-            df = pd.DataFrame(results)
+    # 4. 所有權人姓名 + 稱謂 (1先生 / 2女士)
+    owner_sec = clean_full
+    owner_page_idx = 1
+    for idx, pt in enumerate(pages_text):
+        if "建物所有權部" in pt:
+            owner_page_idx = idx
+            owner_sec = pt
+            break
 
-            columns_to_show = [
-                "建物門牌", "總坪數", "主建物(坪)", "附屬(坪)", "公設(坪)",
-                "車位標示", "所有權人", "戶籍地址"
-            ]
-            df = df[columns_to_show]
+    raw_name = ""
+    name_match = re.search(r"所有權人\s*\n\s*([^\n\r]+)", owner_sec)
+    if name_match:
+        raw_name = name_match.group(1).replace("*", "").strip()
 
-            st.subheader("📋 精耕物件清單")
-            st.dataframe(df, use_container_width=True)
+    title = ""
+    id_match = re.search(r"([A-Za-z])\s*([12])\s*[\d\*]{2,}", owner_sec)
+    if id_match:
+        code = id_match.group(2)
+        if code == "1":
+            title = "先生"
+        elif code == "2":
+            title = "女士"
 
-            csv_data = df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label="📥 匯出精耕清單 (Excel CSV)",
-                data=csv_data,
-                file_name="精耕物件清單.csv",
-                mime="text/csv"
-            )
+    if raw_name:
+        data["所有權人"] = raw_name + title
+
+    # 5. 戶籍地址：精準只呼叫 AI 辨識第 2 頁的那行文字
+    data["戶籍地址"] = ocr_address_only(file_bytes, page_index=owner_page_idx)
+
+    return data
+
+# 介面展示
+if uploaded_files:
+    results = []
+    with st.spinner(f"正在秒級整理 {len(uploaded_files)} 份謄本資料..."):
+        for f in uploaded_files:
+            try:
+                info = parse_transcript_fast(f)
+                results.append(info)
+            except Exception as e:
+                st.error(f"檔案 {f.name} 處理失敗：{e}")
+
+    if results:
+        st.success(f"✅ 成功整理 {len(results)} 筆資料！")
+        df = pd.DataFrame(results)
+
+        columns_to_show = [
+            "建物門牌", "總坪數", "主建物(坪)", "附屬(坪)", "公設(坪)",
+            "車位標示", "所有權人", "戶籍地址"
+        ]
+        df = df[columns_to_show]
+
+        st.subheader("📋 精耕物件清單")
+        st.dataframe(df, use_container_width=True)
+
+        csv_data = df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="📥 匯出精耕清單 (Excel CSV)",
+            data=csv_data,
+            file_name="精耕物件清單.csv",
+            mime="text/csv"
+        )
