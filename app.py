@@ -8,8 +8,8 @@ import time
 
 st.set_page_config(page_title="房產精耕謄本助手", layout="wide")
 
-st.title("🏡 房產精耕小工具：謄本精準擷取 (高穩定版)")
-st.write("透過原生多模態 AI 直接讀取謄本 PDF，自動攻克圖片戶籍地址、計算坪數與判斷稱謂！")
+st.title("🏡 房產精耕小工具：謄本精準擷取 (正式穩定版)")
+st.write("透過多模態 AI 直接讀取謄本 PDF，自動辨識圖片戶籍地址、計算坪數與判斷稱謂！")
 
 # 讀取 API Key (優先從 Secrets 抓，若無則在側邊欄輸入)
 api_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -46,45 +46,43 @@ def extract_with_gemini(file_bytes, filename):
     5. 戶籍地址：位於「建物所有權部」的「地址」欄位（注意：即使該欄位在 PDF 中為嵌入圖片，也請進行 OCR 精準識別出完整縣市市區路名門牌）。若被星號遮蔽則填「隱匿」。
     """
 
-    # 優先使用最穩定的 1.5-flash，若遇 503 伺服器忙碌則自動嘗試 1.5-pro
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
-    last_err = None
-
-    for m_name in models_to_try:
-        for attempt in range(2): # 每個模型最多重試兩次
-            try:
-                response = client.models.generate_content(
-                    model=m_name,
-                    contents=[
-                        types.Part.from_bytes(
-                            data=file_bytes,
-                            mime_type='application/pdf'
-                        ),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=PropertyInfo,
-                        temperature=0.1
-                    )
+    # 官方指定最新標準 flash 模型
+    target_model = 'gemini-2.5-flash'
+    
+    # 設置自動重試（應對伺服器尖峰 503 暫時塞車）
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=target_model,
+                contents=[
+                    types.Part.from_bytes(
+                        data=file_bytes,
+                        mime_type='application/pdf'
+                    ),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=PropertyInfo,
+                    temperature=0.1
                 )
-                res_dict = json.loads(response.text)
-                return {
-                    "建物門牌": res_dict.get("doorplate", "未識別"),
-                    "總坪數": round(float(res_dict.get("total_area", 0.0)), 2),
-                    "主建物(坪)": round(float(res_dict.get("main_area", 0.0)), 2),
-                    "附屬(坪)": round(float(res_dict.get("sub_area", 0.0)), 2),
-                    "公設(坪)": round(float(res_dict.get("pub_area", 0.0)), 2),
-                    "車位標示": res_dict.get("parking", "無/未標示"),
-                    "所有權人": res_dict.get("owner_name", "未識別"),
-                    "戶籍地址": res_dict.get("res_address", "未識別")
-                }
-            except Exception as e:
-                last_err = e
-                time.sleep(1.5) # 稍作等待後重試
+            )
+            res_dict = json.loads(response.text)
+            return {
+                "建物門牌": res_dict.get("doorplate", "未識別"),
+                "總坪數": round(float(res_dict.get("total_area", 0.0)), 2),
+                "主建物(坪)": round(float(res_dict.get("main_area", 0.0)), 2),
+                "附屬(坪)": round(float(res_dict.get("sub_area", 0.0)), 2),
+                "公設(坪)": round(float(res_dict.get("pub_area", 0.0)), 2),
+                "車位標示": res_dict.get("parking", "無/未標示"),
+                "所有權人": res_dict.get("owner_name", "未識別"),
+                "戶籍地址": res_dict.get("res_address", "未識別")
+            }
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))  # 依序等待 2秒、4秒後重試
                 continue
-
-    raise last_err
+            raise e
 
 if uploaded_files:
     if not api_key:
