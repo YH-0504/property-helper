@@ -1,6 +1,6 @@
 streamlit
 pdfplumber
-google-genai
 pandas
 pypdfium2
+pytesseract
 Pillow
