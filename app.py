@@ -1,13 +1,14 @@
 import streamlit as st
 import pdfplumber
 import pypdfium2 as pdfium
-import pytesseract
-from PIL import Image, ImageEnhance
+from google import genai
+from google.genai import types
 import re
 import pandas as pd
 import io
+import time
 
-# 1. 頁面基本配置
+# 1. 頁面配置與高階商務外觀
 st.set_page_config(
     page_title="房產精耕謄本助手 Pro",
     page_icon="🏢",
@@ -15,11 +16,9 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# 2. 注入現代高階商務 CSS 樣式
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&family=Noto+Sans+TC:wght@400;500;700&display=swap');
-    
     html, body, [class*="css"] {
         font-family: 'Plus Jakarta Sans', 'Noto Sans TC', sans-serif;
     }
@@ -29,7 +28,7 @@ st.markdown("""
     .hero-container {
         background: linear-gradient(135deg, #1E293B 0%, #0F172A 100%);
         border-radius: 16px;
-        padding: 32px 36px;
+        padding: 30px 36px;
         color: #FFFFFF;
         margin-bottom: 24px;
         box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.1);
@@ -44,7 +43,7 @@ st.markdown("""
         border-radius: 9999px;
         font-size: 0.8rem;
         font-weight: 600;
-        margin-bottom: 12px;
+        margin-bottom: 10px;
     }
     .hero-title {
         font-size: 2.1rem;
@@ -96,14 +95,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 3. 頁首橫幅
 st.markdown("""
 <div class="hero-container">
-    <div class="hero-badge">OFFLINE OCR PRO</div>
+    <div class="hero-badge">OPTIMIZED PIPELINE</div>
     <h1 class="hero-title">建物謄本・電傳自動化精耕分析儀</h1>
-    <p class="hero-desc">強化版：多筆共有部分公設折行精算、其他登記事項停車位精確提取、地址圖像座標鎖定。</p>
+    <p class="hero-desc">本地高精度解析（姓名去星號、公設坪數持分實算、純車位編號）＋ 專用視覺地址識別。</p>
 </div>
 """, unsafe_allow_html=True)
+
+# 讀取 API Key (供圖片地址視覺識別備援使用)
+api_key = st.secrets.get("GEMINI_API_KEY", "")
+if not api_key:
+    api_key = st.sidebar.text_input("請輸入 Google Gemini API Key (選填，若有設定可精準解析圖片地址)", type="password")
 
 uploaded_files = st.file_uploader(
     "拖曳或選取謄本 PDF 檔案進行批次萃取",
@@ -111,77 +114,59 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-def get_address_by_flexible_coordinates(file_bytes, page_idx=1):
-    """ 透過統編與權利範圍夾角定位，精確擷取地址圖片並 OCR """
-    debug_img = None
-    debug_raw = ""
+def extract_address_visual(file_bytes, page_idx=1):
+    """ 專門針對第二頁的圖片戶籍地址進行精準視覺識別，徹底過濾頁尾雜訊 """
+    if not api_key:
+        return "需填APIKey以辨識圖片"
+    
     try:
-        pdf_stream = io.BytesIO(file_bytes)
-        top_limit = None
-        bottom_limit = None
-        
-        with pdfplumber.open(pdf_stream) as pdf:
-            target_p = pdf.pages[page_idx] if len(pdf.pages) > page_idx else pdf.pages[-1]
-            page_w = target_p.width
-            page_h = target_p.height
-            words = target_p.extract_words()
-            
-            for w in words:
-                text = w["text"]
-                if "地址" in text or "住址" in text:
-                    top_limit = w["top"] - 4
-                    bottom_limit = w["bottom"] + 4
-                    break
-                if "編號" in text or "統一" in text:
-                    top_limit = w["bottom"]
-                if "權利範圍" in text:
-                    bottom_limit = w["top"]
-
         pdf_doc = pdfium.PdfDocument(file_bytes)
-        target_p_img = pdf_doc[page_idx if len(pdf_doc) > page_idx else len(pdf_doc) - 1]
-        scale = 3.5
-        pil_img = target_p_img.render(scale=scale).to_pil()
-        img_w, img_h = pil_img.size
-        scale_y = img_h / page_h
-
-        if top_limit and bottom_limit:
-            y0 = int(top_limit * scale_y)
-            y1 = int(bottom_limit * scale_y)
-        elif top_limit:
-            y0 = int(top_limit * scale_y)
-            y1 = int((top_limit + 45) * scale_y)
-        else:
-            y0 = int(img_h * 0.34)
-            y1 = int(img_h * 0.44)
-
-        x0 = int(img_w * 0.22)
-        x1 = int(img_w * 0.95)
+        target_idx = page_idx if len(pdf_doc) > page_idx else len(pdf_doc) - 1
+        page = pdf_doc[target_idx]
         
-        cropped = pil_img.crop((x0, y0, x1, y1))
-        debug_img = cropped
-
-        gray = cropped.convert('L')
-        enhancer = ImageEnhance.Contrast(gray)
-        enhanced = enhancer.enhance(2.0)
+        # 渲染第二頁為圖片
+        img = page.render(scale=2.0).to_pil()
+        w, h = img.size
         
-        ocr_result = pytesseract.image_to_string(enhanced, lang='chi_tra+eng', config='--psm 6')
-        debug_raw = ocr_result
+        # 精準裁切所有權部的中上方（地址所在區域，避開最下方的查詢時間等頁尾）
+        crop_area = (int(w * 0.18), int(h * 0.28), int(w * 0.95), int(h * 0.55))
+        cropped = img.crop(crop_area)
         
-        clean_text = re.sub(r"[\s\|\r\n\t]+", "", ocr_result)
-        clean_text = re.sub(r"^(?:地址|住址)[：:\s]*", "", clean_text)
-        clean_text = re.sub(r"(?:權利範圍.*|統一編號.*)", "", clean_text)
+        buf = io.BytesIO()
+        cropped.save(buf, format='JPEG', quality=90)
+        img_bytes = buf.getvalue()
 
-        if any(star in clean_text for star in ["***", "＊＊＊"]) or "隱匿" in clean_text:
-            return "隱匿", debug_img, debug_raw
-        
-        if len(clean_text) >= 4 and not any(k in clean_text for k in ["查詢時間", "資料來源", "登記次序"]):
-            return clean_text, debug_img, debug_raw
-            
-        return "隱匿", debug_img, debug_raw
-    except Exception as e:
-        return "辨識錯誤", debug_img, str(e)
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            "這張截圖是台灣建物所有權部。請精準讀取「地址」欄位裡的中文地址。"
+            "如果該地址有被星號隱匿，請只回覆「隱匿」。"
+            "如果是正常地址，請只輸出地址文字，不要輸出「地址：」、不要包含「權利範圍」或頁尾的「查詢時間」等任何其他文字。"
+        )
 
-def parse_transcript_fast(file):
+        for _ in range(2):
+            try:
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=[
+                        types.Part.from_bytes(data=img_bytes, mime_type='image/jpeg'),
+                        prompt
+                    ]
+                )
+                addr_text = response.text.strip().replace("\n", "").replace("`", "")
+                addr_text = re.sub(r"^(?:地址|住址)[：:\s]*", "", addr_text)
+                
+                # 安全過濾：避免抓到頁尾
+                if any(k in addr_text for k in ["查詢時間", "資料來源", "登記次序", "權利範圍"]):
+                    return "隱匿"
+                return addr_text if len(addr_text) > 3 else "隱匿"
+            except Exception:
+                time.sleep(1.5)
+                continue
+        return "隱匿"
+    except Exception:
+        return "隱匿"
+
+def parse_transcript_optimized(file):
     file_bytes = file.read()
     file_stream = io.BytesIO(file_bytes)
 
@@ -193,7 +178,7 @@ def parse_transcript_fast(file):
 
     full_text = "\n".join(pages_text)
 
-    # 全形轉半形
+    # 全形轉半形標準化
     half_text = ""
     for char in full_text:
         code = ord(char)
@@ -215,11 +200,11 @@ def parse_transcript_fast(file):
         "公設(坪)": 0.0,
         "車位標示": "無/未標示",
         "所有權人": "未識別",
-        "戶籍地址": "抓取錯誤"
+        "戶籍地址": "隱匿"
     }
 
     # -------------------------------------------------------------
-    # 1. 建物完整門牌 (補齊 臺南市東區 等)
+    # 1. 建物完整門牌 (自動補齊 臺南市東區 等)
     # -------------------------------------------------------------
     city_district = ""
     region_match = re.search(r"([^\d\n\r\s]{2,3}(?:市|縣))\s*([^\d\n\r\s]{1,4}(?:區|鄉|鎮|市))", clean_full)
@@ -248,7 +233,7 @@ def parse_transcript_fast(file):
                 data["建物門牌"] = f"{city_district}{raw_doorplate}"
 
     # -------------------------------------------------------------
-    # 2. 面積計算 (主建、附屬、多筆公設持分精算)
+    # 2. 面積計算：主建、附屬、共有部分持分公設 -> 全部計入總坪數
     # -------------------------------------------------------------
     # 主建物 (層次面積)
     main_m2 = 0.0
@@ -259,7 +244,7 @@ def parse_transcript_fast(file):
         main_m2 = float(main_match.group(1))
     data["主建物(坪)"] = round(main_m2 * 0.3025, 2)
 
-    # 附屬建物（陽台、露台、雨遮等）
+    # 附屬建物（陽台、露台、雨遮等加總）
     sub_m2 = 0.0
     sub_matches = re.findall(r"(?:陽台|露台|雨遮|平台|花台)[^\d\n\r]*?面積\s*([\d\.]+)\s*平方公\s*尺", clean_full)
     if not sub_matches:
@@ -268,59 +253,65 @@ def parse_transcript_fast(file):
         sub_m2 = sum([float(m) for m in sub_matches])
     data["附屬(坪)"] = round(sub_m2 * 0.3025, 2)
 
-    # 共有部分（公設持分加總：面積 * 分子 / 分母 * 0.3025）
+    # 共有部分（公設持分加總：平方公尺前數值 × 權利範圍持分 × 0.3025）
     pub_m2 = 0.0
-    # 將整段文字標準化為單行以消除「平方公\n尺」或多行間隔帶來的斷裂
-    one_line_clean = " ".join(clean_full.split())
+    shared_section = clean_full
+    if "共有部分" in clean_full:
+        shared_section = clean_full.split("共有部分")[1]
+        if "建物所有權部" in shared_section:
+            shared_section = shared_section.split("建物所有權部")[0]
+            
+    shared_one_line = " ".join(shared_section.split())
+    # 抓取「數字 平方公尺 ... 權利範圍 分子 分之 分母」
+    pub_items = re.findall(r"([\d\.]+)\s*平方公\s*尺.*?權利範圍\s*(\d+)\s*分之\s*(\d+)", shared_one_line)
     
-    # 匹配範例：建號967.07平方公尺...權利範圍 100000分之1629 或 建號 967.07 平方公 尺 ... 100000分之1629
-    pub_patterns = re.findall(r"(?:共有部分|建號)\s*.*?([\d\.]+)\s*平方公\s*尺.*?權利範圍\s*(\d+)\s*分之\s*(\d+)", one_line_clean)
-    
-    if not pub_patterns:
-        # 備用匹配：有些電傳只寫「建號 00865-000 967.07 100000分之1629」
-        pub_patterns = re.findall(r"建號[^\d]*?[\d\-]+\s+([\d\.]+).*?權利範圍\s*(\d+)\s*分之\s*(\d+)", one_line_clean)
-
-    for p_area, denom, numer in pub_patterns:
+    for area_str, denom_str, numer_str in pub_items:
         try:
-            pub_m2 += float(p_area) * (float(numer) / float(denom))
+            area_val = float(area_str)
+            denom = float(denom_str)
+            numer = float(numer_str)
+            if denom > 0:
+                pub_m2 += area_val * (numer / denom)
         except:
             pass
-    
+
     data["公設(坪)"] = round(pub_m2 * 0.3025, 2)
+    # 總坪數 = 主建 + 附屬 + 公設
     data["總坪數"] = round(data["主建物(坪)"] + data["附屬(坪)"] + data["公設(坪)"], 2)
 
     # -------------------------------------------------------------
-    # 3. 車位標示 (特別針對第一頁共有部分下方「其他登記事項」中註記的車位)
+    # 3. 車位標示 (只抓編號，不參考權利範圍)
     # -------------------------------------------------------------
-    parking_found = ""
-    
-    # 優先從「其他登記事項」搜尋「含停車位...」
-    # 格式可能如：含停車位編號：地下一層車位編號B1-12號、含停車位編號B4-105
-    p_match1 = re.search(r"(?:含停車位|停車位編號|車位編號)[：:\s]*([^\n\r，,；;]+)", clean_full)
-    if p_match1:
-        parking_found = p_match1.group(1).strip()
-    
-    # 備用：若上述沒抓到，搜尋地下室層次或 B1~B5 編號
-    if not parking_found:
-        p_match2 = re.search(r"(地下一層|地下二層|地下三層|地下四層|地下五層|B[1-5])[^\n\r，,；;]*?(?:車位|編號)[：:\s]*([^\n\r\s，,；;]+)", clean_full)
-        if p_match2:
-            parking_found = f"{p_match2.group(1)} {p_match2.group(2)}".strip()
-            
-    # 備用：抓「B4-105」或類似號碼
-    if not parking_found:
-        p_match3 = re.search(r"([B|b][1-5][\s\-]*(?:號)?\d+)", clean_full)
-        if p_match3:
-            parking_found = p_match3.group(1).strip()
+    parking_no = ""
+    car_match = re.search(r"(?:含停車位|停車位編號|車位編號|停車位)[：:\s]*([^\n\r，,；;\(（]+)", clean_full)
+    if car_match:
+        cand = car_match.group(1).strip()
+        sub_no = re.search(r"([B|b]?\d+[\s\-]*(?:號)?\d*號?|[B|b]\d+[\-_]\d+)", cand)
+        if sub_no:
+            floor_m = re.search(r"(地下[一二三四五]層|B[1-5])", cand)
+            if floor_m and floor_m.group(1) not in sub_no.group(1):
+                parking_no = f"{floor_m.group(1)} {sub_no.group(1)}".strip()
+            else:
+                parking_no = sub_no.group(1).strip()
+        else:
+            parking_no = cand
 
-    if parking_found:
-        # 去除多餘空格或標點
-        parking_found = re.sub(r"^含", "", parking_found).strip()
-        data["車位標示"] = parking_found
+    if not parking_no:
+        alt_match = re.search(r"(?:地下[一二三四五]層|B[1-5])[^\d\n\r]*?(\d+[\s\-]*號?|\d+號)", clean_full)
+        if alt_match:
+            val = alt_match.group(0).strip()
+            if not any(k in val for k in ["平方", "民國", "年", "月", "日"]):
+                parking_no = val
+
+    if parking_no:
+        parking_no = re.sub(r"^(?:含|編號|：|:)+", "", parking_no).strip()
+        parking_no = re.split(r"(?:權利範圍|全部|\d+分之\d+)", parking_no)[0].strip()
+        data["車位標示"] = parking_no if len(parking_no) > 0 else "無/未標示"
     else:
         data["車位標示"] = "無/未標示"
 
     # -------------------------------------------------------------
-    # 4. 所有權人姓名與性別
+    # 4. 所有權人姓名與性別 (精準穿透排版 + 徹底刪除星號)
     # -------------------------------------------------------------
     owner_sec = clean_full
     owner_page_idx = 1
@@ -333,9 +324,11 @@ def parse_transcript_fast(file):
     raw_name = ""
     name_m = re.search(r"所有權人[：:\s\n]*([^\d\n\r\s]+)", owner_sec)
     if name_m:
+        # 同時移除半形 '*' 與全形 '＊'
         raw_name = re.sub(r"[\*＊]+", "", name_m.group(1)).strip()
 
     title = ""
+    # 身分證第一碼數字判斷：1 先生、2 女士
     id_m = re.search(r"([A-Za-z])\s*([12])[\d\*＊]{2,}", owner_sec)
     if id_m:
         code = id_m.group(2)
@@ -348,24 +341,30 @@ def parse_transcript_fast(file):
         data["所有權人"] = raw_name + title
 
     # -------------------------------------------------------------
-    # 5. 戶籍地址辨識
+    # 5. 戶籍地址：優先本地文字提取，若為防護圖片則走專用視覺識別
     # -------------------------------------------------------------
-    addr_val, dbg_img, dbg_raw = get_address_by_flexible_coordinates(file_bytes, page_idx=owner_page_idx)
-    data["戶籍地址"] = addr_val
+    got_text_addr = False
+    local_addr_m = re.search(r"(?:地址|住址)[：:\s\n]*([^\n\r]+)", owner_sec)
+    if local_addr_m:
+        cand = local_addr_m.group(1).strip()
+        cand = re.split(r"(?:權利範圍|統一編號|權狀字號)", cand)[0].strip()
+        if any(w in cand for w in ["市", "縣", "鄉", "鎮", "區", "路", "街", "巷"]):
+            data["戶籍地址"] = cand
+            got_text_addr = True
 
-    return data, dbg_img, dbg_raw
+    if not got_text_addr:
+        data["戶籍地址"] = extract_address_visual(file_bytes, page_idx=owner_page_idx)
 
-# 5. 執行分析
+    return data
+
+# 5. 介面呈現與批次處理
 if uploaded_files:
     results = []
-    debug_info = {}
-
-    with st.spinner("⚡ 正在解析建物謄本資料，請稍候..."):
+    with st.spinner("⚡ 正在進行最佳化解析，請稍候..."):
         for f in uploaded_files:
             try:
-                info, dbg_img, dbg_raw = parse_transcript_fast(f)
+                info = parse_transcript_optimized(f)
                 results.append(info)
-                debug_info[f.name] = {"img": dbg_img, "raw": dbg_raw}
             except Exception as e:
                 st.error(f"檔案 {f.name} 處理失敗：{e}")
 
@@ -407,7 +406,7 @@ if uploaded_files:
 
         st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
         
-        # 結果數據表
+        # 數據總表
         st.dataframe(df, use_container_width=True, height=min(450, 45 + len(df) * 38))
 
         st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
@@ -419,11 +418,3 @@ if uploaded_files:
             file_name="社區精耕謄本整理名冊.csv",
             mime="text/csv"
         )
-
-        with st.expander("🔍 查看地址裁切與 OCR 辨識過程 (若地址有誤可在此確認)"):
-            for fname, d in debug_info.items():
-                st.write(f"**檔案：{fname}**")
-                if d["img"]:
-                    st.image(d["img"], caption="系統自動裁切出的地址影像區域", width=500)
-                st.write(f"OCR 原始吐出字串：`{d['raw']}`")
-                st.markdown("---")
