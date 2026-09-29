@@ -2,7 +2,7 @@ import streamlit as st
 import pdfplumber
 import pypdfium2 as pdfium
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance
 import re
 import pandas as pd
 import io
@@ -18,29 +18,23 @@ st.set_page_config(
 # 2. 注入現代高階商務 CSS 樣式
 st.markdown("""
 <style>
-    /* 引入現代無襯線字型 */
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&family=Noto+Sans+TC:wght@400;500;700&display=swap');
     
     html, body, [class*="css"] {
         font-family: 'Plus Jakarta Sans', 'Noto Sans TC', sans-serif;
     }
-
-    /* 主背景微漸層 */
     .stApp {
         background: linear-gradient(180deg, #F8FAFC 0%, #F1F5F9 100%);
     }
-
-    /* 頂部 Hero Banner */
     .hero-container {
         background: linear-gradient(135deg, #1E293B 0%, #0F172A 100%);
         border-radius: 16px;
-        padding: 36px 40px;
+        padding: 32px 36px;
         color: #FFFFFF;
         margin-bottom: 24px;
-        box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.1), 0 8px 10px -6px rgba(15, 23, 42, 0.1);
+        box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.1);
         border: 1px solid rgba(255, 255, 255, 0.1);
     }
-    
     .hero-badge {
         display: inline-block;
         background: rgba(14, 165, 233, 0.2);
@@ -51,153 +45,141 @@ st.markdown("""
         font-size: 0.8rem;
         font-weight: 600;
         margin-bottom: 12px;
-        letter-spacing: 0.5px;
     }
-
     .hero-title {
-        font-size: 2.2rem;
+        font-size: 2.1rem;
         font-weight: 700;
         margin: 0;
-        letter-spacing: -0.5px;
-        background: linear-gradient(120deg, #FFFFFF 30%, #94A3B8 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
+        color: #FFFFFF;
     }
-
     .hero-desc {
         color: #94A3B8;
-        font-size: 1rem;
+        font-size: 0.95rem;
         margin-top: 8px;
         margin-bottom: 0;
     }
-
-    /* 上傳區域美化 */
     [data-testid="stFileUploader"] {
         background: #FFFFFF;
         border-radius: 16px;
         padding: 24px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
         border: 1px solid #E2E8F0;
-        transition: all 0.2s ease;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
     }
-    [data-testid="stFileUploader"]:hover {
-        border-color: #0EA5E9;
-        box-shadow: 0 10px 15px -3px rgba(14, 165, 233, 0.1);
-    }
-
-    /* 數據統計小卡片 (Metric Cards) */
     .stat-card {
         background: #FFFFFF;
         border-radius: 14px;
-        padding: 20px 24px;
+        padding: 18px 22px;
         border: 1px solid #E2E8F0;
         box-shadow: 0 2px 4px rgba(0, 0, 0, 0.02);
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
     }
     .stat-label {
-        font-size: 0.85rem;
+        font-size: 0.8rem;
         color: #64748B;
         font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 0.5px;
     }
     .stat-value {
-        font-size: 1.8rem;
+        font-size: 1.7rem;
         font-weight: 700;
         color: #0F172A;
     }
-
-    /* 下載按鈕強化 */
     .stDownloadButton > button {
         background: linear-gradient(135deg, #0EA5E9 0%, #0284C7 100%) !important;
         color: white !important;
         font-weight: 600 !important;
-        font-size: 1rem !important;
-        padding: 12px 28px !important;
         border-radius: 10px !important;
         border: none !important;
         box-shadow: 0 4px 14px rgba(14, 165, 233, 0.3) !important;
-        transition: all 0.2s ease !important;
     }
-    .stDownloadButton > button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 6px 20px rgba(14, 165, 233, 0.4) !important;
-    }
-
-    /* 隱藏 Streamlit 預設多餘頂部元件 */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
-# 3. 頁首橫幅區塊
+# 3. 頁首橫幅
 st.markdown("""
 <div class="hero-container">
     <div class="hero-badge">OFFLINE OCR PRO</div>
     <h1 class="hero-title">建物謄本・電傳自動化精耕分析儀</h1>
-    <p class="hero-desc">支援批次解析華安電傳與官方地政謄本，自動完成：門牌拼接、坪數拆解、車位萃取、稱謂判定與防護欄位精準定位。</p>
+    <p class="hero-desc">強化版：多筆共有部分公設折行精算、其他登記事項停車位精確提取、地址圖像座標鎖定。</p>
 </div>
 """, unsafe_allow_html=True)
 
-# 4. 上傳區
 uploaded_files = st.file_uploader(
     "拖曳或選取謄本 PDF 檔案進行批次萃取",
     type=["pdf"],
-    accept_multiple_files=True,
-    help="支援單檔或一次上傳數十份謄本 PDF"
+    accept_multiple_files=True
 )
 
-def get_address_by_coordinates(file_bytes, page_idx=1):
-    """ 利用『地址』文字座標精確定位右側區域進行 OCR """
+def get_address_by_flexible_coordinates(file_bytes, page_idx=1):
+    """ 透過統編與權利範圍夾角定位，精確擷取地址圖片並 OCR """
+    debug_img = None
+    debug_raw = ""
     try:
-        addr_box = None
         pdf_stream = io.BytesIO(file_bytes)
+        top_limit = None
+        bottom_limit = None
+        
         with pdfplumber.open(pdf_stream) as pdf:
             target_p = pdf.pages[page_idx] if len(pdf.pages) > page_idx else pdf.pages[-1]
             page_w = target_p.width
             page_h = target_p.height
             words = target_p.extract_words()
+            
             for w in words:
-                if "地址" in w["text"] or "住址" in w["text"]:
-                    addr_box = w
+                text = w["text"]
+                if "地址" in text or "住址" in text:
+                    top_limit = w["top"] - 4
+                    bottom_limit = w["bottom"] + 4
                     break
-        
+                if "編號" in text or "統一" in text:
+                    top_limit = w["bottom"]
+                if "權利範圍" in text:
+                    bottom_limit = w["top"]
+
         pdf_doc = pdfium.PdfDocument(file_bytes)
         target_p_img = pdf_doc[page_idx if len(pdf_doc) > page_idx else len(pdf_doc) - 1]
-        scale = 3.0
+        scale = 3.5
         pil_img = target_p_img.render(scale=scale).to_pil()
         img_w, img_h = pil_img.size
+        scale_y = img_h / page_h
 
-        if addr_box:
-            scale_x = img_w / page_w
-            scale_y = img_h / page_h
-            x0 = int(addr_box["x1"] * scale_x) + 5
-            y0 = int((addr_box["top"] - 3) * scale_y)
-            x1 = int(img_w * 0.92)
-            y1 = int((addr_box["bottom"] + 5) * scale_y)
-            crop_rect = (x0, y0, x1, y1)
+        if top_limit and bottom_limit:
+            y0 = int(top_limit * scale_y)
+            y1 = int(bottom_limit * scale_y)
+        elif top_limit:
+            y0 = int(top_limit * scale_y)
+            y1 = int((top_limit + 45) * scale_y)
         else:
-            crop_rect = (int(img_w * 0.22), int(img_h * 0.28), int(img_w * 0.90), int(img_h * 0.45))
+            y0 = int(img_h * 0.34)
+            y1 = int(img_h * 0.44)
 
-        cropped = pil_img.crop(crop_rect)
+        x0 = int(img_w * 0.22)
+        x1 = int(img_w * 0.95)
+        
+        cropped = pil_img.crop((x0, y0, x1, y1))
+        debug_img = cropped
+
         gray = cropped.convert('L')
-        bw = gray.point(lambda x: 0 if x < 180 else 255, '1')
+        enhancer = ImageEnhance.Contrast(gray)
+        enhanced = enhancer.enhance(2.0)
         
-        text = pytesseract.image_to_string(bw, lang='chi_tra+eng', config='--psm 7')
-        clean_text = re.sub(r"[\s\|\r\n]+", "", text)
+        ocr_result = pytesseract.image_to_string(enhanced, lang='chi_tra+eng', config='--psm 6')
+        debug_raw = ocr_result
+        
+        clean_text = re.sub(r"[\s\|\r\n\t]+", "", ocr_result)
         clean_text = re.sub(r"^(?:地址|住址)[：:\s]*", "", clean_text)
-        
+        clean_text = re.sub(r"(?:權利範圍.*|統一編號.*)", "", clean_text)
+
         if any(star in clean_text for star in ["***", "＊＊＊"]) or "隱匿" in clean_text:
-            return "隱匿"
+            return "隱匿", debug_img, debug_raw
         
-        if len(clean_text) >= 4 and not any(k in clean_text for k in ["查詢時間", "資料來源", "登記次序", "權利範圍"]):
-            return clean_text
+        if len(clean_text) >= 4 and not any(k in clean_text for k in ["查詢時間", "資料來源", "登記次序"]):
+            return clean_text, debug_img, debug_raw
             
-        return "隱匿"
+        return "隱匿", debug_img, debug_raw
     except Exception as e:
-        return "辨識錯誤"
+        return "辨識錯誤", debug_img, str(e)
 
 def parse_transcript_fast(file):
     file_bytes = file.read()
@@ -236,7 +218,9 @@ def parse_transcript_fast(file):
         "戶籍地址": "抓取錯誤"
     }
 
-    # 1. 門牌組合
+    # -------------------------------------------------------------
+    # 1. 建物完整門牌 (補齊 臺南市東區 等)
+    # -------------------------------------------------------------
     city_district = ""
     region_match = re.search(r"([^\d\n\r\s]{2,3}(?:市|縣))\s*([^\d\n\r\s]{1,4}(?:區|鄉|鎮|市))", clean_full)
     if region_match:
@@ -263,40 +247,81 @@ def parse_transcript_fast(file):
             else:
                 data["建物門牌"] = f"{city_district}{raw_doorplate}"
 
-    # 2. 坪數
+    # -------------------------------------------------------------
+    # 2. 面積計算 (主建、附屬、多筆公設持分精算)
+    # -------------------------------------------------------------
+    # 主建物 (層次面積)
     main_m2 = 0.0
-    main_match = re.search(r"層次面積\s*([\d\.]+)\s*平方公尺", clean_full)
+    main_match = re.search(r"層次面積\s*([\d\.]+)\s*平方公\s*尺", clean_full)
+    if not main_match:
+        main_match = re.search(r"層次面積\s*([\d\.]+)", clean_full)
     if main_match:
         main_m2 = float(main_match.group(1))
     data["主建物(坪)"] = round(main_m2 * 0.3025, 2)
 
+    # 附屬建物（陽台、露台、雨遮等）
     sub_m2 = 0.0
-    sub_matches = re.findall(r"(?:陽台|露台|雨遮|平台|花台)[^\d\n\r]*?面積\s*([\d\.]+)\s*平方公尺", clean_full)
+    sub_matches = re.findall(r"(?:陽台|露台|雨遮|平台|花台)[^\d\n\r]*?面積\s*([\d\.]+)\s*平方公\s*尺", clean_full)
+    if not sub_matches:
+        sub_matches = re.findall(r"(?:陽台|露台|雨遮|平台|花台)[^\d\n\r]*?面積\s*([\d\.]+)", clean_full)
     if sub_matches:
         sub_m2 = sum([float(m) for m in sub_matches])
     data["附屬(坪)"] = round(sub_m2 * 0.3025, 2)
 
+    # 共有部分（公設持分加總：面積 * 分子 / 分母 * 0.3025）
     pub_m2 = 0.0
-    linear_text = clean_full.replace("\n", " ")
-    pub_matches = re.findall(r"建號\s*([\d\.]+)\s*平方公\s*尺.*?權利範圍\s*(\d+)\s*分之\s*(\d+)", linear_text)
-    for p_area, denom, numer in pub_matches:
+    # 將整段文字標準化為單行以消除「平方公\n尺」或多行間隔帶來的斷裂
+    one_line_clean = " ".join(clean_full.split())
+    
+    # 匹配範例：建號967.07平方公尺...權利範圍 100000分之1629 或 建號 967.07 平方公 尺 ... 100000分之1629
+    pub_patterns = re.findall(r"(?:共有部分|建號)\s*.*?([\d\.]+)\s*平方公\s*尺.*?權利範圍\s*(\d+)\s*分之\s*(\d+)", one_line_clean)
+    
+    if not pub_patterns:
+        # 備用匹配：有些電傳只寫「建號 00865-000 967.07 100000分之1629」
+        pub_patterns = re.findall(r"建號[^\d]*?[\d\-]+\s+([\d\.]+).*?權利範圍\s*(\d+)\s*分之\s*(\d+)", one_line_clean)
+
+    for p_area, denom, numer in pub_patterns:
         try:
             pub_m2 += float(p_area) * (float(numer) / float(denom))
         except:
             pass
+    
     data["公設(坪)"] = round(pub_m2 * 0.3025, 2)
     data["總坪數"] = round(data["主建物(坪)"] + data["附屬(坪)"] + data["公設(坪)"], 2)
 
-    # 3. 車位
-    parking_match = re.search(r"(?:編號|車位)[：:\s]*([A-Za-z0-9\-\_]+号|[A-Za-z0-9\-\_]+號|[B|b]\d+[\s\-]*(?:號)?\d*)", clean_full)
-    if not parking_match:
-        parking_match = re.search(r"(地下一層|地下二層|地下三層|地下四層|地下五層|B[1-5])[^\n\r]*?(?:車位|編號)[：:\s]*([^\n\r\s]+)", clean_full)
-        if parking_match:
-            data["車位標示"] = f"{parking_match.group(1)} {parking_match.group(2)}"
-    else:
-        data["車位標示"] = parking_match.group(1).strip()
+    # -------------------------------------------------------------
+    # 3. 車位標示 (特別針對第一頁共有部分下方「其他登記事項」中註記的車位)
+    # -------------------------------------------------------------
+    parking_found = ""
+    
+    # 優先從「其他登記事項」搜尋「含停車位...」
+    # 格式可能如：含停車位編號：地下一層車位編號B1-12號、含停車位編號B4-105
+    p_match1 = re.search(r"(?:含停車位|停車位編號|車位編號)[：:\s]*([^\n\r，,；;]+)", clean_full)
+    if p_match1:
+        parking_found = p_match1.group(1).strip()
+    
+    # 備用：若上述沒抓到，搜尋地下室層次或 B1~B5 編號
+    if not parking_found:
+        p_match2 = re.search(r"(地下一層|地下二層|地下三層|地下四層|地下五層|B[1-5])[^\n\r，,；;]*?(?:車位|編號)[：:\s]*([^\n\r\s，,；;]+)", clean_full)
+        if p_match2:
+            parking_found = f"{p_match2.group(1)} {p_match2.group(2)}".strip()
+            
+    # 備用：抓「B4-105」或類似號碼
+    if not parking_found:
+        p_match3 = re.search(r"([B|b][1-5][\s\-]*(?:號)?\d+)", clean_full)
+        if p_match3:
+            parking_found = p_match3.group(1).strip()
 
-    # 4. 姓名性別
+    if parking_found:
+        # 去除多餘空格或標點
+        parking_found = re.sub(r"^含", "", parking_found).strip()
+        data["車位標示"] = parking_found
+    else:
+        data["車位標示"] = "無/未標示"
+
+    # -------------------------------------------------------------
+    # 4. 所有權人姓名與性別
+    # -------------------------------------------------------------
     owner_sec = clean_full
     owner_page_idx = 1
     for idx, pt in enumerate(pages_text):
@@ -322,19 +347,25 @@ def parse_transcript_fast(file):
     if raw_name:
         data["所有權人"] = raw_name + title
 
-    # 5. 戶籍地址
-    data["戶籍地址"] = get_address_by_coordinates(file_bytes, page_idx=owner_page_idx)
+    # -------------------------------------------------------------
+    # 5. 戶籍地址辨識
+    # -------------------------------------------------------------
+    addr_val, dbg_img, dbg_raw = get_address_by_flexible_coordinates(file_bytes, page_idx=owner_page_idx)
+    data["戶籍地址"] = addr_val
 
-    return data
+    return data, dbg_img, dbg_raw
 
-# 5. 執行分析與精美呈現
+# 5. 執行分析
 if uploaded_files:
     results = []
+    debug_info = {}
+
     with st.spinner("⚡ 正在解析建物謄本資料，請稍候..."):
         for f in uploaded_files:
             try:
-                info = parse_transcript_fast(f)
+                info, dbg_img, dbg_raw = parse_transcript_fast(f)
                 results.append(info)
+                debug_info[f.name] = {"img": dbg_img, "raw": dbg_raw}
             except Exception as e:
                 st.error(f"檔案 {f.name} 處理失敗：{e}")
 
@@ -348,13 +379,13 @@ if uploaded_files:
 
         st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
         
-        # 儀表板小卡片（KPI Metrics）
+        # 儀表板
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown(f"""
             <div class="stat-card">
                 <span class="stat-label">已解析戶數</span>
-                <span class="stat-value">{len(df)} <span style="font-size: 1rem; font-weight: normal; color: #64748B;">筆</span></span>
+                <span class="stat-value">{len(df)} <span style="font-size: 1rem; color: #64748B;">筆</span></span>
             </div>
             """, unsafe_allow_html=True)
         with col2:
@@ -362,7 +393,7 @@ if uploaded_files:
             st.markdown(f"""
             <div class="stat-card">
                 <span class="stat-label">總建坪規模</span>
-                <span class="stat-value">{total_sum} <span style="font-size: 1rem; font-weight: normal; color: #64748B;">坪</span></span>
+                <span class="stat-value">{total_sum} <span style="font-size: 1rem; color: #64748B;">坪</span></span>
             </div>
             """, unsafe_allow_html=True)
         with col3:
@@ -370,22 +401,17 @@ if uploaded_files:
             st.markdown(f"""
             <div class="stat-card">
                 <span class="stat-label">具備車位戶數</span>
-                <span class="stat-value">{parking_count} <span style="font-size: 1rem; font-weight: normal; color: #64748B;">筆</span></span>
+                <span class="stat-value">{parking_count} <span style="font-size: 1rem; color: #64748B;">筆</span></span>
             </div>
             """, unsafe_allow_html=True)
 
         st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
         
-        # 結果數據總表
-        st.dataframe(
-            df,
-            use_container_width=True,
-            height=min(450, 45 + len(df) * 38)
-        )
+        # 結果數據表
+        st.dataframe(df, use_container_width=True, height=min(450, 45 + len(df) * 38))
 
         st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
 
-        # 匯出按鈕
         csv_data = df.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
             label="📥 匯出精耕專用名冊 (Excel CSV)",
@@ -393,3 +419,11 @@ if uploaded_files:
             file_name="社區精耕謄本整理名冊.csv",
             mime="text/csv"
         )
+
+        with st.expander("🔍 查看地址裁切與 OCR 辨識過程 (若地址有誤可在此確認)"):
+            for fname, d in debug_info.items():
+                st.write(f"**檔案：{fname}**")
+                if d["img"]:
+                    st.image(d["img"], caption="系統自動裁切出的地址影像區域", width=500)
+                st.write(f"OCR 原始吐出字串：`{d['raw']}`")
+                st.markdown("---")
